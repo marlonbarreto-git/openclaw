@@ -33,6 +33,8 @@ import {
 } from "./protocol/index.js";
 
 const MAX_PENDING_REQUESTS = 1000;
+const DEFAULT_REQUEST_TTL_MS = 600_000; // 10 minutes
+const DEFAULT_CLEANUP_INTERVAL_MS = 60_000; // 60 seconds
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -53,6 +55,7 @@ export type GatewayClientMetrics = {
   onRequestError?: (info: { method: string; durationMs: number; error: string }) => void;
   onReconnect?: (info: { attempt: number; delayMs: number }) => void;
   onPendingPoolSize?: (info: { size: number }) => void;
+  onOrphanedRequestsCleanup?: (info: { count: number }) => void;
 };
 
 export type GatewayClientOptions = {
@@ -81,6 +84,8 @@ export type GatewayClientOptions = {
   onClose?: (code: number, reason: string) => void;
   onGap?: (info: { expected: number; received: number }) => void;
   metrics?: GatewayClientMetrics;
+  requestTtlMs?: number;
+  cleanupIntervalMs?: number;
 };
 
 export const GATEWAY_CLOSE_CODE_HINTS: Readonly<Record<number, string>> = {
@@ -108,6 +113,7 @@ export class GatewayClient {
   private lastTick: number | null = null;
   private tickIntervalMs = 30_000;
   private tickTimer: NodeJS.Timeout | null = null;
+  private pendingCleanupTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: GatewayClientOptions) {
     this.opts = {
@@ -187,6 +193,10 @@ export class GatewayClient {
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
+    }
+    if (this.pendingCleanupTimer) {
+      clearInterval(this.pendingCleanupTimer);
+      this.pendingCleanupTimer = null;
     }
     this.ws?.close();
     this.ws = null;
@@ -284,6 +294,7 @@ export class GatewayClient {
             : 30_000;
         this.lastTick = Date.now();
         this.startTickWatch();
+        this.startPendingCleanup();
         this.opts.onHelloOk?.(helloOk);
       })
       .catch((err) => {
@@ -375,6 +386,10 @@ export class GatewayClient {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
+    if (this.pendingCleanupTimer) {
+      clearInterval(this.pendingCleanupTimer);
+      this.pendingCleanupTimer = null;
+    }
     const delay = this.backoffMs;
     this.reconnectAttempt++;
     this.opts.metrics?.onReconnect?.({ attempt: this.reconnectAttempt, delayMs: delay });
@@ -404,6 +419,29 @@ export class GatewayClient {
       const gap = Date.now() - this.lastTick;
       if (gap > this.tickIntervalMs * 2) {
         this.ws?.close(4000, "tick timeout");
+      }
+    }, interval);
+  }
+
+  private startPendingCleanup() {
+    if (this.pendingCleanupTimer) {
+      clearInterval(this.pendingCleanupTimer);
+    }
+    const ttl = this.opts.requestTtlMs ?? DEFAULT_REQUEST_TTL_MS;
+    const interval = this.opts.cleanupIntervalMs ?? DEFAULT_CLEANUP_INTERVAL_MS;
+    this.pendingCleanupTimer = setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+      for (const [id, entry] of this.pending) {
+        if (entry.startMs && now - entry.startMs > ttl) {
+          entry.reject(new Error(`pending request timed out after ${ttl}ms (method: ${entry.method ?? "unknown"})`));
+          this.pending.delete(id);
+          cleaned++;
+        }
+      }
+      if (cleaned > 0) {
+        this.opts.metrics?.onOrphanedRequestsCleanup?.({ count: cleaned });
+        logDebug(`gateway client: cleaned up ${cleaned} orphaned pending request(s)`);
       }
     }, interval);
   }
