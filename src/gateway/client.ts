@@ -32,6 +32,8 @@ import {
   validateResponseFrame,
 } from "./protocol/index.js";
 
+const MAX_PENDING_REQUESTS = 1000;
+
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: unknown) => void;
@@ -50,6 +52,7 @@ export type GatewayClientMetrics = {
   onRequestSuccess?: (info: { method: string; durationMs: number }) => void;
   onRequestError?: (info: { method: string; durationMs: number; error: string }) => void;
   onReconnect?: (info: { attempt: number; delayMs: number }) => void;
+  onPendingPoolSize?: (info: { size: number }) => void;
 };
 
 export type GatewayClientOptions = {
@@ -448,6 +451,9 @@ export class GatewayClient {
       );
     }
     const expectFinal = opts?.expectFinal === true;
+    if (this.pending.size >= MAX_PENDING_REQUESTS) {
+      throw new Error(`gateway pending request limit exceeded (${MAX_PENDING_REQUESTS})`);
+    }
     const startMs = Date.now();
     this.opts.metrics?.onRequestStart?.({ method });
     const p = new Promise<T>((resolve, reject) => {
@@ -471,6 +477,7 @@ export class GatewayClient {
         startMs,
         method,
       });
+      this.opts.metrics?.onPendingPoolSize?.({ size: this.pending.size });
     });
     this.ws.send(JSON.stringify(frame));
     return p;
