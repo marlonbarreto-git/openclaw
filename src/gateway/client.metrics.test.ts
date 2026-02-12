@@ -333,4 +333,90 @@ describe("GatewayClient metrics", () => {
     client.stop();
     await Promise.all(pending);
   }, 10000);
+
+  test("cleans up orphaned pending requests after TTL", async () => {
+    const port = await getFreePort();
+    wss = new WebSocketServer({ port, host: "127.0.0.1" });
+    // Server accepts connect but never responds to subsequent requests.
+    wss.on("connection", (socket) => {
+      let connected = false;
+      socket.on("message", (data) => {
+        const msg = JSON.parse(rawDataToString(data)) as {
+          type: string;
+          id: string;
+          method?: string;
+        };
+        if (!connected) {
+          connected = true;
+          const helloOk = {
+            type: "hello-ok",
+            protocol: 2,
+            server: { version: "dev", connId: "c1" },
+            features: { methods: [], events: [] },
+            snapshot: {
+              presence: [],
+              health: {},
+              stateVersion: { presence: 1, health: 1 },
+              uptimeMs: 1,
+            },
+            policy: {
+              maxPayload: 512 * 1024,
+              maxBufferedBytes: 1024 * 1024,
+              tickIntervalMs: 30_000,
+            },
+          };
+          socket.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload: helloOk }));
+        }
+        // Don't respond to subsequent requests — they stay pending until TTL cleanup.
+      });
+    });
+
+    const metrics: GatewayClientMetrics = {
+      onOrphanedRequestsCleanup: vi.fn(),
+    };
+
+    const client = new GatewayClient({
+      url: `ws://127.0.0.1:${port}`,
+      metrics,
+      requestTtlMs: 200,
+      cleanupIntervalMs: 100,
+    });
+
+    const connected = new Promise<void>((resolve) => {
+      client.start();
+      const original = client["opts"].onHelloOk;
+      client["opts"].onHelloOk = (hello) => {
+        original?.(hello);
+        resolve();
+      };
+    });
+
+    await connected;
+
+    // Send a request that will never get a response.
+    const requestPromise = client.request("orphaned.method").catch((err: Error) => err);
+
+    // Wait for TTL + cleanup interval to pass (200ms TTL + 60s cleanup, but we use fake timers below).
+    // Actually, let's just wait long enough for the cleanup to fire.
+    // The cleanup runs every 60s by default, but we need a shorter interval for testing.
+    // We'll wait for the request to be rejected by the cleanup mechanism.
+    await vi.waitFor(
+      async () => {
+        const result = await Promise.race([
+          requestPromise,
+          new Promise((resolve) => setTimeout(resolve, 50, "still-pending")),
+        ]);
+        expect(result).not.toBe("still-pending");
+      },
+      { timeout: 5000, interval: 100 },
+    );
+
+    const result = await requestPromise;
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(/pending request timed out/);
+
+    expect(metrics.onOrphanedRequestsCleanup).toHaveBeenCalledWith({ count: 1 });
+
+    client.stop();
+  }, 10000);
 });
