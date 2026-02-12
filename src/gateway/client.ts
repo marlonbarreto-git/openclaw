@@ -36,6 +36,20 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: unknown) => void;
   expectFinal: boolean;
+  startMs?: number;
+  method?: string;
+};
+
+/**
+ * Optional metrics collector for observing gateway client request lifecycle.
+ * Implement this interface to integrate with monitoring systems (Prometheus,
+ * DataDog, OpenTelemetry, etc.).
+ */
+export type GatewayClientMetrics = {
+  onRequestStart?: (info: { method: string }) => void;
+  onRequestSuccess?: (info: { method: string; durationMs: number }) => void;
+  onRequestError?: (info: { method: string; durationMs: number; error: string }) => void;
+  onReconnect?: (info: { attempt: number; delayMs: number }) => void;
 };
 
 export type GatewayClientOptions = {
@@ -63,6 +77,7 @@ export type GatewayClientOptions = {
   onConnectError?: (err: Error) => void;
   onClose?: (code: number, reason: string) => void;
   onGap?: (info: { expected: number; received: number }) => void;
+  metrics?: GatewayClientMetrics;
 };
 
 export const GATEWAY_CLOSE_CODE_HINTS: Readonly<Record<number, string>> = {
@@ -259,6 +274,7 @@ export class GatewayClient {
           });
         }
         this.backoffMs = 1000;
+        this.reconnectAttempt = 0;
         this.tickIntervalMs =
           typeof helloOk.policy?.tickIntervalMs === "number"
             ? helloOk.policy.tickIntervalMs
@@ -346,6 +362,8 @@ export class GatewayClient {
     }, 750);
   }
 
+  private reconnectAttempt = 0;
+
   private scheduleReconnect() {
     if (this.closed) {
       return;
@@ -355,6 +373,8 @@ export class GatewayClient {
       this.tickTimer = null;
     }
     const delay = this.backoffMs;
+    this.reconnectAttempt++;
+    this.opts.metrics?.onReconnect?.({ attempt: this.reconnectAttempt, delayMs: delay });
     this.backoffMs = Math.min(this.backoffMs * 2, 30_000);
     setTimeout(() => this.start(), delay).unref();
   }
@@ -428,11 +448,28 @@ export class GatewayClient {
       );
     }
     const expectFinal = opts?.expectFinal === true;
+    const startMs = Date.now();
+    this.opts.metrics?.onRequestStart?.({ method });
     const p = new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
-        resolve: (value) => resolve(value as T),
-        reject,
+        resolve: (value) => {
+          this.opts.metrics?.onRequestSuccess?.({
+            method,
+            durationMs: Date.now() - startMs,
+          });
+          resolve(value as T);
+        },
+        reject: (err) => {
+          this.opts.metrics?.onRequestError?.({
+            method,
+            durationMs: Date.now() - startMs,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          reject(err);
+        },
         expectFinal,
+        startMs,
+        method,
       });
     });
     this.ws.send(JSON.stringify(frame));
