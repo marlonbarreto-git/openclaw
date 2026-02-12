@@ -58,6 +58,14 @@ export type GatewayClientMetrics = {
   onOrphanedRequestsCleanup?: (info: { count: number }) => void;
 };
 
+export type GatewayConnectionState = {
+  connected: boolean;
+  reconnectAttempt: number;
+  pendingRequests: number;
+  lastTickAgoMs: number | null;
+  uptimeMs: number | null;
+};
+
 export type GatewayClientOptions = {
   url?: string; // ws://127.0.0.1:18789
   token?: string;
@@ -111,6 +119,7 @@ export class GatewayClient {
   private connectTimer: NodeJS.Timeout | null = null;
   // Track last tick to detect silent stalls.
   private lastTick: number | null = null;
+  private connectedAt: number | null = null;
   private tickIntervalMs = 30_000;
   private tickTimer: NodeJS.Timeout | null = null;
   private pendingCleanupTimer: NodeJS.Timeout | null = null;
@@ -190,6 +199,7 @@ export class GatewayClient {
 
   stop() {
     this.closed = true;
+    this.connectedAt = null;
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
@@ -288,6 +298,7 @@ export class GatewayClient {
         }
         this.backoffMs = 1000;
         this.reconnectAttempt = 0;
+        this.connectedAt = Date.now();
         this.tickIntervalMs =
           typeof helloOk.policy?.tickIntervalMs === "number"
             ? helloOk.policy.tickIntervalMs
@@ -379,6 +390,7 @@ export class GatewayClient {
   private reconnectAttempt = 0;
 
   private scheduleReconnect() {
+    this.connectedAt = null;
     if (this.closed) {
       return;
     }
@@ -471,6 +483,16 @@ export class GatewayClient {
       return new Error("gateway tls fingerprint mismatch");
     }
     return null;
+  }
+
+  getConnectionState(): GatewayConnectionState {
+    return {
+      connected: this.ws !== null && this.ws.readyState === WebSocket.OPEN && this.connectedAt !== null,
+      reconnectAttempt: this.reconnectAttempt,
+      pendingRequests: this.pending.size,
+      lastTickAgoMs: this.lastTick !== null ? Date.now() - this.lastTick : null,
+      uptimeMs: this.connectedAt !== null ? Date.now() - this.connectedAt : null,
+    };
   }
 
   async request<T = Record<string, unknown>>(

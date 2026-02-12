@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import { rawDataToString } from "../infra/ws.js";
-import { GatewayClient, type GatewayClientMetrics } from "./client.js";
+import { GatewayClient, type GatewayClientMetrics, type GatewayConnectionState } from "./client.js";
 
 async function getFreePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
@@ -419,4 +419,40 @@ describe("GatewayClient metrics", () => {
 
     client.stop();
   }, 10000);
+
+  test("reports accurate connection state", async () => {
+    const port = await getFreePort();
+    wss = new WebSocketServer({ port, host: "127.0.0.1" });
+    setupWss(wss);
+
+    const client = new GatewayClient({
+      url: `ws://127.0.0.1:${port}`,
+    });
+
+    const connected = new Promise<void>((resolve) => {
+      client.start();
+      const original = client["opts"].onHelloOk;
+      client["opts"].onHelloOk = (hello) => {
+        original?.(hello);
+        resolve();
+      };
+    });
+
+    await connected;
+
+    const state: GatewayConnectionState = client.getConnectionState();
+    expect(state.connected).toBe(true);
+    expect(state.reconnectAttempt).toBe(0);
+    expect(state.pendingRequests).toBe(0);
+    expect(state.uptimeMs).toBeTypeOf("number");
+    expect(state.uptimeMs!).toBeGreaterThanOrEqual(0);
+    expect(state.lastTickAgoMs).toBeTypeOf("number");
+    expect(state.lastTickAgoMs!).toBeGreaterThanOrEqual(0);
+
+    client.stop();
+
+    const stoppedState = client.getConnectionState();
+    expect(stoppedState.connected).toBe(false);
+    expect(stoppedState.uptimeMs).toBeNull();
+  }, 5000);
 });
