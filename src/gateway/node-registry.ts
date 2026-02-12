@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { GatewayWsClient } from "./server/ws-types.js";
 
+const MAX_PENDING_INVOKES = 1000;
+
 export type NodeSession = {
   nodeId: string;
   connId: string;
@@ -111,6 +113,12 @@ export class NodeRegistry {
     timeoutMs?: number;
     idempotencyKey?: string;
   }): Promise<NodeInvokeResult> {
+    if (this.pendingInvokes.size >= MAX_PENDING_INVOKES) {
+      return {
+        ok: false,
+        error: { code: "QUEUE_FULL", message: `pending invoke limit exceeded (${MAX_PENDING_INVOKES})` },
+      };
+    }
     const node = this.nodesById.get(params.nodeId);
     if (!node) {
       return {

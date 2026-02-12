@@ -230,4 +230,107 @@ describe("GatewayClient metrics", () => {
 
     client.stop();
   }, 5000);
+
+  test("calls onPendingPoolSize after adding a pending request", async () => {
+    const port = await getFreePort();
+    wss = new WebSocketServer({ port, host: "127.0.0.1" });
+    setupWss(wss, () => ({ ok: true, payload: { result: "ok" } }));
+
+    const metrics: GatewayClientMetrics = {
+      onPendingPoolSize: vi.fn(),
+    };
+
+    const client = new GatewayClient({
+      url: `ws://127.0.0.1:${port}`,
+      metrics,
+    });
+
+    const connected = new Promise<void>((resolve) => {
+      client.start();
+      const original = client["opts"].onHelloOk;
+      client["opts"].onHelloOk = (hello) => {
+        original?.(hello);
+        resolve();
+      };
+    });
+
+    await connected;
+    await client.request("pool.check", {});
+
+    expect(metrics.onPendingPoolSize).toHaveBeenCalled();
+    const call = (metrics.onPendingPoolSize as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+      size: number;
+    };
+    expect(call.size).toBeGreaterThanOrEqual(1);
+
+    client.stop();
+  }, 5000);
+
+  test("throws when pending request limit is exceeded", async () => {
+    const port = await getFreePort();
+    wss = new WebSocketServer({ port, host: "127.0.0.1" });
+    // Don't auto-respond so requests stay pending.
+    wss.on("connection", (socket) => {
+      let connected = false;
+      socket.on("message", (data) => {
+        const msg = JSON.parse(rawDataToString(data)) as {
+          type: string;
+          id: string;
+          method?: string;
+        };
+        if (!connected) {
+          connected = true;
+          const helloOk = {
+            type: "hello-ok",
+            protocol: 2,
+            server: { version: "dev", connId: "c1" },
+            features: { methods: [], events: [] },
+            snapshot: {
+              presence: [],
+              health: {},
+              stateVersion: { presence: 1, health: 1 },
+              uptimeMs: 1,
+            },
+            policy: {
+              maxPayload: 512 * 1024,
+              maxBufferedBytes: 1024 * 1024,
+              tickIntervalMs: 30_000,
+            },
+          };
+          socket.send(JSON.stringify({ type: "res", id: msg.id, ok: true, payload: helloOk }));
+        }
+        // Don't respond to subsequent requests — they stay pending.
+      });
+    });
+
+    const client = new GatewayClient({
+      url: `ws://127.0.0.1:${port}`,
+    });
+
+    const connected = new Promise<void>((resolve) => {
+      client.start();
+      const original = client["opts"].onHelloOk;
+      client["opts"].onHelloOk = (hello) => {
+        original?.(hello);
+        resolve();
+      };
+    });
+
+    await connected;
+
+    // Fill up the pending pool to the limit (1000).
+    // Catch rejections so client.stop() doesn't cause unhandled rejections.
+    const pending: Promise<unknown>[] = [];
+    for (let i = 0; i < 1000; i++) {
+      pending.push(client.request("noop").catch(() => {}));
+    }
+
+    // The next request should throw.
+    await expect(client.request("overflow")).rejects.toThrow(
+      /gateway pending request limit exceeded/,
+    );
+
+    client.stop();
+    await Promise.all(pending);
+  }, 10000);
 });
